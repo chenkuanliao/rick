@@ -15,6 +15,7 @@ class TextToSpeechService:
         self.settings = settings
         self._model: Any | None = None
         self._load_error: str | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def status(self) -> dict[str, Any]:
@@ -28,7 +29,13 @@ class TextToSpeechService:
 
     async def synthesize(self, text: str) -> Path:
         model = await self._get_model()
-        return await asyncio.to_thread(self._synthesize_sync, model, text)
+        async with self._lock:
+            return await asyncio.to_thread(self._synthesize_sync, model, text)
+
+    async def synthesize_chunk(self, text: str) -> Path:
+        model = await self._get_model()
+        async with self._lock:
+            return await asyncio.to_thread(self._synthesize_sync, model, text, False)
 
     async def _get_model(self) -> Any:
         if self._model is not None:
@@ -66,7 +73,7 @@ class TextToSpeechService:
             return "cpu"
         return "cuda"
 
-    def _synthesize_sync(self, model: Any, text: str) -> Path:
+    def _synthesize_sync(self, model: Any, text: str, split_text: bool = True) -> Path:
         import numpy as np
         import librosa
         import soundfile as sf
@@ -84,7 +91,7 @@ class TextToSpeechService:
                 sf.write(prompt_file, audio.astype("float32"), sample_rate)
                 prompt_path = str(prompt_file)
 
-            chunks = split_tts_text(text, self.settings.tts_max_chunk_chars)
+            chunks = split_tts_text(text, self.settings.tts_max_chunk_chars) if split_text else [text.strip()]
             pause = np.zeros(int(model.sr * 0.18), dtype="float32")
             audio_parts = []
             for index, chunk in enumerate(chunks):

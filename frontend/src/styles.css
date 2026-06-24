@@ -729,6 +729,11 @@ h1 {
   border-color: #b9d7f7;
 }
 
+.message.partial {
+  opacity: 0.76;
+  border-style: dashed;
+}
+
 .message.assistant {
   align-self: flex-start;
   background: #ffffff;

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -15,7 +17,7 @@ from .config import FRONTEND_DIST, ensure_data_dirs, get_settings
 from .services.llm import ProviderRegistry, cuda_status
 from .services.chats import ChatStore
 from .services.stt import SpeechToTextService
-from .services.tts import TextToSpeechService
+from .services.tts import TextToSpeechService, split_tts_text
 
 
 settings = get_settings()
@@ -50,6 +52,11 @@ chats = ChatStore()
 
 audio_dir = Path(__file__).resolve().parents[2] / "data" / "audio"
 app.mount("/audio", StaticFiles(directory=audio_dir), name="audio")
+
+FIRST_TTS_CHUNK_MIN_CHARS = 90
+NEXT_TTS_CHUNK_TARGET_CHARS = 220
+FIRST_TTS_CHUNK_MAX_SENTENCES = 2
+NEXT_TTS_CHUNK_MAX_SENTENCES = 3
 
 
 class PromptPayload(BaseModel):
@@ -142,6 +149,7 @@ async def voice_prompt(file: UploadFile = File(...)) -> dict[str, Any]:
 async def chat_socket(websocket: WebSocket) -> None:
     await websocket.accept()
     active_turn: asyncio.Task[None] | None = None
+    partial_transcript: asyncio.Task[None] | None = None
     try:
         while True:
             payload = await websocket.receive_json()
@@ -153,8 +161,16 @@ async def chat_socket(websocket: WebSocket) -> None:
                     active_turn.cancel()
                     await websocket.send_json({"type": "cancelled"})
                     await websocket.send_json({"type": "status", "phase": "idle"})
+                if partial_transcript and not partial_transcript.done():
+                    partial_transcript.cancel()
                 else:
                     await websocket.send_json({"type": "status", "phase": "idle"})
+                continue
+            if payload.get("type") == "live_transcript":
+                if partial_transcript and not partial_transcript.done():
+                    partial_transcript.cancel()
+                partial_transcript = asyncio.create_task(_handle_live_transcript(websocket, payload))
+                partial_transcript.add_done_callback(_consume_cancelled_turn)
                 continue
             if payload.get("type") not in {"turn", "text_turn"}:
                 await websocket.send_json({"type": "error", "message": "Unsupported websocket message type."})
@@ -167,6 +183,8 @@ async def chat_socket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         if active_turn and not active_turn.done():
             active_turn.cancel()
+        if partial_transcript and not partial_transcript.done():
+            partial_transcript.cancel()
         return
     except RuntimeError as exc:
         if "Cannot call \"send\" once a close message has been sent" in str(exc):
@@ -218,18 +236,99 @@ async def _handle_turn(websocket: WebSocket, payload: dict[str, Any]) -> None:
         await websocket.send_json({"type": "error", "message": str(exc)})
 
 
+async def _handle_live_transcript(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    wav_path: Path | None = None
+    try:
+        audio_bytes = decode_audio_data_url_or_base64(payload.get("audio", ""))
+        wav_path = await convert_to_wav_16k_mono(
+            audio_bytes,
+            mime_type=payload.get("mimeType"),
+            settings=settings,
+        )
+        user_text = await stt.transcribe(wav_path)
+        if user_text:
+            await websocket.send_json(
+                {
+                    "type": "partial_transcript",
+                    "role": "user",
+                    "text": user_text,
+                    "sequence": payload.get("sequence"),
+                }
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+    finally:
+        if wav_path is not None:
+            wav_path.unlink(missing_ok=True)
+
+
 async def _handle_user_text(websocket: WebSocket, payload: dict[str, Any], chat_id: str, user_text: str) -> None:
     chat = chats.append_message(chat_id, role="user", text=user_text)
     await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
     await websocket.send_json({"type": "chat", "chat": chat, "chats": chats.list_chats()})
 
     await websocket.send_json({"type": "status", "phase": "thinking"})
-    response_text, provider_key, model = await providers.chat(
+    stream, provider_key, model = await providers.stream_chat(
         payload.get("provider"),
         payload.get("model"),
         chats.llm_messages(chat_id),
         user_text,
     )
+    assistant_id = uuid4().hex
+    audio_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    audio_task = asyncio.create_task(_stream_tts_audio(websocket, audio_queue, provider_key, model))
+    response_parts: list[str] = []
+    tts_buffer = ""
+    tts_pending = ""
+    tts_pending_sentences = 0
+    first_tts_chunk_sent = False
+    started = False
+    try:
+        async for delta in stream:
+            if not started:
+                started = True
+                await websocket.send_json(
+                    {
+                        "type": "assistant_start",
+                        "id": assistant_id,
+                        "provider": provider_key,
+                        "model": model,
+                    }
+                )
+            response_parts.append(delta)
+            tts_buffer += delta
+            await websocket.send_json({"type": "assistant_delta", "id": assistant_id, "text": delta})
+            sentences, tts_buffer = _pop_complete_tts_sentences(tts_buffer)
+            for sentence in sentences:
+                candidate = f"{tts_pending} {sentence}".strip()
+                if tts_pending and len(candidate) > settings.tts_max_chunk_chars:
+                    await _queue_tts_text(audio_queue, tts_pending)
+                    first_tts_chunk_sent = True
+                    tts_pending = sentence
+                    tts_pending_sentences = 1
+                else:
+                    tts_pending = candidate
+                    tts_pending_sentences += 1
+
+                target_chars = NEXT_TTS_CHUNK_TARGET_CHARS if first_tts_chunk_sent else FIRST_TTS_CHUNK_MIN_CHARS
+                target_sentences = NEXT_TTS_CHUNK_MAX_SENTENCES if first_tts_chunk_sent else FIRST_TTS_CHUNK_MAX_SENTENCES
+                if len(tts_pending) >= target_chars or tts_pending_sentences >= target_sentences:
+                    await _queue_tts_text(audio_queue, tts_pending)
+                    first_tts_chunk_sent = True
+                    tts_pending = ""
+                    tts_pending_sentences = 0
+        remaining = f"{tts_pending} {tts_buffer.strip()}".strip()
+        if remaining:
+            await _queue_tts_text(audio_queue, remaining)
+    finally:
+        await audio_queue.put(None)
+        await audio_task
+
+    response_text = "".join(response_parts).strip()
+    if not response_text:
+        raise RuntimeError("The provider returned an empty response.")
     chat = chats.append_message(
         chat_id,
         role="assistant",
@@ -237,28 +336,54 @@ async def _handle_user_text(websocket: WebSocket, payload: dict[str, Any], chat_
         provider=provider_key,
         model=model,
     )
-    await websocket.send_json(
-        {
-            "type": "transcript",
-            "role": "assistant",
-            "text": response_text,
-            "provider": provider_key,
-            "model": model,
-        }
-    )
+    await websocket.send_json({"type": "assistant_done", "id": assistant_id})
     await websocket.send_json({"type": "chat", "chat": chat, "chats": chats.list_chats()})
+    await websocket.send_json({"type": "status", "phase": "idle"})
 
-    await websocket.send_json({"type": "status", "phase": "synthesizing"})
-    audio_path = await tts.synthesize(response_text)
-    await websocket.send_json(
-        {
-            "type": "audio",
-            "url": f"/audio/{audio_path.name}",
-            "text": response_text,
-            "provider": provider_key,
-            "model": model,
-        }
-    )
+
+async def _stream_tts_audio(
+    websocket: WebSocket,
+    audio_queue: asyncio.Queue[str | None],
+    provider_key: str,
+    model: str | None,
+) -> None:
+    while True:
+        text = await audio_queue.get()
+        try:
+            if text is None:
+                return
+            await websocket.send_json({"type": "status", "phase": "synthesizing"})
+            audio_path = await tts.synthesize_chunk(text)
+            await websocket.send_json(
+                {
+                    "type": "audio",
+                    "url": f"/audio/{audio_path.name}",
+                    "text": text,
+                    "provider": provider_key,
+                    "model": model,
+                    "streaming": True,
+                }
+            )
+        finally:
+            audio_queue.task_done()
+
+
+async def _queue_tts_text(audio_queue: asyncio.Queue[str | None], text: str) -> None:
+    for chunk in split_tts_text(text, settings.tts_max_chunk_chars):
+        cleaned = chunk.strip()
+        if cleaned:
+            await audio_queue.put(cleaned)
+
+
+def _pop_complete_tts_sentences(text: str) -> tuple[list[str], str]:
+    matches = list(re.finditer(r"(?<=[.!?])\s+", text))
+    if not matches:
+        return [], text
+    cut = matches[-1].end()
+    complete = text[:cut].strip()
+    remaining = text[cut:]
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", complete) if item.strip()]
+    return sentences, remaining
 
 
 if FRONTEND_DIST.exists():

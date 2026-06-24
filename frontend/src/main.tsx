@@ -28,6 +28,7 @@ import "./styles.css";
 
 type Phase = "idle" | "listening" | "transcribing" | "thinking" | "synthesizing" | "speaking" | "error";
 type MobilePanel = "chat" | "chats" | "settings";
+type ResponseActivity = { thinking: boolean; synthesizing: boolean; speaking: boolean };
 
 type ProviderStatus = {
   name: string;
@@ -175,9 +176,16 @@ function App() {
   const [promptSaved, setPromptSaved] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState("");
   const [pendingAudioUrl, setPendingAudioUrl] = useState("");
+  const [queuedAudioCount, setQueuedAudioCount] = useState(0);
   const [audioPlayBlocked, setAudioPlayBlocked] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
   const [composerExpanded, setComposerExpanded] = useState(false);
+  const [partialTranscript, setPartialTranscript] = useState("");
+  const [responseActivity, setResponseActivity] = useState<ResponseActivity>({
+    thinking: false,
+    synthesizing: false,
+    speaking: false,
+  });
   const [micStatus, setMicStatus] = useState<BrowserMicStatus>(() => getBrowserMicStatus());
   const socketRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -189,9 +197,14 @@ function App() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioQueueRef = useRef<string[]>([]);
+  const audioPlayingRef = useRef(false);
   const audioUnlockedRef = useRef(false);
+  const preloadedAudioUrlsRef = useRef<Set<string>>(new Set());
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const liveTranscriptSequenceRef = useRef(0);
+  const liveTranscriptLastSentRef = useRef(0);
 
   useEffect(() => {
     setMicStatus(getBrowserMicStatus());
@@ -243,16 +256,17 @@ function App() {
   const providerOptions = useMemo(() => {
     return Object.entries(config?.providers.providers ?? {});
   }, [config]);
-  const currentPhase = phaseDetail[phase];
-  const activityLevel = phase === "listening" || phase === "speaking" ? level : phase === "idle" || phase === "error" ? 0 : 0.42;
-  const turnInProgress = phase !== "idle" && phase !== "error";
+  const visiblePhase = prioritizedPhase(phase, responseActivity);
+  const currentPhase = phaseDetail[visiblePhase];
+  const activityLevel = visiblePhase === "listening" || visiblePhase === "speaking" ? level : visiblePhase === "idle" || visiblePhase === "error" ? 0 : 0.42;
+  const turnInProgress = visiblePhase !== "idle" && visiblePhase !== "error";
   const primaryActionLabel: Record<Phase, string> = {
     idle: "Start recording",
-    listening: "Stop and send",
-    transcribing: "Stop transcribing",
-    thinking: "Stop thinking",
-    synthesizing: "Stop voice generation",
-    speaking: "Stop speaking",
+    listening: "Stop",
+    transcribing: "Stop",
+    thinking: "Stop",
+    synthesizing: "Stop",
+    speaking: "Stop",
     error: "Start recording",
   };
 
@@ -289,12 +303,18 @@ function App() {
     try {
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+          void maybeSendLiveTranscript();
+        }
       };
       recorder.onstop = submitRecording;
       recorderRef.current = recorder;
       startMeter(stream);
       recorder.start(100);
+      setPartialTranscript("");
+      liveTranscriptSequenceRef.current = 0;
+      liveTranscriptLastSentRef.current = 0;
       setPhase("listening");
     } catch (error) {
       stream.getTracks().forEach((track) => track.stop());
@@ -350,9 +370,23 @@ function App() {
     );
   }
 
+  async function maybeSendLiveTranscript() {
+    const recorder = recorderRef.current;
+    const socket = socketRef.current;
+    if (!recorder || recorder.state !== "recording" || !socket || socket.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (now - liveTranscriptLastSentRef.current < 1800 || chunksRef.current.length < 4) return;
+    liveTranscriptLastSentRef.current = now;
+    const sequence = ++liveTranscriptSequenceRef.current;
+    const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+    const audio = await blobToBase64(blob);
+    socket.send(JSON.stringify({ type: "live_transcript", audio, mimeType: blob.type, sequence }));
+  }
+
   function cancelCurrentWork() {
     if (isAssistantAudioPlaying()) {
       stopAssistantAudio();
+      audioQueueRef.current = [];
       addMessage("system", "Playback stopped.", true);
       return;
     }
@@ -363,11 +397,13 @@ function App() {
     }
     if (phase === "speaking") {
       stopAssistantAudio();
+      audioQueueRef.current = [];
       addMessage("system", "Playback stopped.", true);
       return;
     }
     if (phase === "transcribing" || phase === "thinking" || phase === "synthesizing") {
       socketRef.current?.send(JSON.stringify({ type: "cancel" }));
+      audioQueueRef.current = [];
       setPhase("idle");
       setLevel(0);
       addMessage("system", "Stopped the current turn.", true);
@@ -390,6 +426,7 @@ function App() {
         chatId: activeChatId,
       }),
     );
+    setResponseActivity((current) => ({ ...current, thinking: true }));
     setPhase("thinking");
   }
 
@@ -449,24 +486,49 @@ function App() {
 
   function handleSocketMessage(message: any) {
     if (message.type === "status") {
-      if (message.phase === "idle" && isAssistantAudioPlaying()) {
-        setPhase("speaking");
-      } else {
-        setPhase(message.phase);
+      if (message.phase === "thinking") {
+        setResponseActivity((current) => ({ ...current, thinking: true }));
       }
+      if (message.phase === "synthesizing") {
+        setResponseActivity((current) => ({ ...current, synthesizing: true }));
+      }
+      if (message.phase === "idle") {
+        setResponseActivity((current) => ({ ...current, thinking: false, synthesizing: false }));
+      }
+      if (message.phase === "error") {
+        setResponseActivity({ thinking: false, synthesizing: false, speaking: false });
+      }
+      setPhase(message.phase);
     }
     if (message.type === "transcript") {
+      if (message.role === "user") setPartialTranscript("");
       addMessage(message.role, message.text, false, message.provider, message.model);
     }
+    if (message.type === "partial_transcript") {
+      setPartialTranscript(message.text);
+    }
+    if (message.type === "assistant_start") {
+      setResponseActivity((current) => ({ ...current, thinking: true }));
+      addMessage("assistant", "", false, message.provider, message.model, message.id);
+    }
+    if (message.type === "assistant_delta") {
+      appendMessageText(message.id, message.text);
+    }
+    if (message.type === "assistant_done") {
+      setPartialTranscript("");
+      setResponseActivity((current) => ({ ...current, thinking: false, synthesizing: false }));
+    }
     if (message.type === "audio") {
-      playAssistantAudio(message.url);
+      enqueueAssistantAudio(message.url);
     }
     if (message.type === "error") {
       setPhase("error");
+      setResponseActivity({ thinking: false, synthesizing: false, speaking: false });
       addMessage("system", message.message, true);
     }
     if (message.type === "cancelled") {
       setPhase("idle");
+      setResponseActivity({ thinking: false, synthesizing: false, speaking: false });
       setLevel(0);
     }
     if (message.type === "chat") {
@@ -479,51 +541,96 @@ function App() {
   }
 
   function playAssistantAudio(url: string) {
-    const nextUrl = `${url}?t=${Date.now()}`;
     const audio = audioRef.current ?? new Audio();
     audioRef.current = audio;
+    audioPlayingRef.current = true;
     audio.preload = "auto";
     audio.setAttribute("playsinline", "true");
-    audio.src = nextUrl;
-    setPendingAudioUrl(nextUrl);
+    audio.src = url;
+    setPendingAudioUrl(url);
     setAudioPlayBlocked(false);
     audio.onplay = () => {
       setAudioPlayBlocked(false);
-      setPhase("speaking");
+      setResponseActivity((current) => ({ ...current, speaking: true }));
       pulsePlayback();
     };
     audio.onended = () => {
-      setPhase("idle");
       setLevel(0);
       setPendingAudioUrl("");
-      setAudioPlayBlocked(false);
+      audioPlayingRef.current = false;
+      setResponseActivity((current) => ({ ...current, speaking: false }));
+      playNextAssistantAudio();
     };
     audio.onerror = () => {
-      setPhase("error");
-      addMessage("system", "Browser could not play the synthesized audio.", true);
+      setLevel(0);
+      setPendingAudioUrl("");
+      audioPlayingRef.current = false;
+      setResponseActivity((current) => ({ ...current, speaking: false }));
+      addMessage("system", "Skipped one speech chunk the browser could not play.", true);
+      playNextAssistantAudio({ ignoreBlocked: true });
     };
     void audio.play().catch((error) => {
       setPhase("idle");
       setLevel(0);
       setAudioPlayBlocked(true);
+      audioPlayingRef.current = false;
+      setResponseActivity((current) => ({ ...current, speaking: false }));
       addMessage("system", `Audio is ready. Tap Play audio to hear it. ${error instanceof Error ? error.message : ""}`.trim(), true);
     });
   }
 
+  function enqueueAssistantAudio(url: string) {
+    const queuedUrl = `${url}?t=${Date.now()}`;
+    audioQueueRef.current.push(queuedUrl);
+    preloadAudioUrl(queuedUrl);
+    setQueuedAudioCount(audioQueueRef.current.length);
+    playNextAssistantAudio();
+  }
+
+  function playNextAssistantAudio(options: { ignoreBlocked?: boolean } = {}) {
+    if (audioPlayingRef.current || (audioPlayBlocked && !options.ignoreBlocked)) return;
+    const nextAudio = audioQueueRef.current.shift();
+    setQueuedAudioCount(audioQueueRef.current.length);
+    if (!nextAudio) {
+      setPhase((current) => (current === "speaking" || current === "synthesizing" ? "idle" : current));
+      return;
+    }
+    const nextQueuedAudio = audioQueueRef.current[0];
+    if (nextQueuedAudio) preloadAudioUrl(nextQueuedAudio);
+    playAssistantAudio(nextAudio);
+  }
+
+  function preloadAudioUrl(url: string) {
+    if (preloadedAudioUrlsRef.current.has(url)) return;
+    preloadedAudioUrlsRef.current.add(url);
+    void fetch(url, { cache: "force-cache" })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Audio preload failed: ${response.status}`);
+        return response.arrayBuffer();
+      })
+      .catch(() => {
+        preloadedAudioUrlsRef.current.delete(url);
+      });
+  }
+
   async function resumeAssistantAudio() {
     const audio = audioRef.current;
-    if (!audio || !pendingAudioUrl) return;
     await unlockAssistantAudio();
-    audio.setAttribute("playsinline", "true");
-    audio.src = pendingAudioUrl;
-    void audio.play().catch((error) => {
-      setPhase("error");
-      addMessage("system", `Audio playback failed: ${error instanceof Error ? error.message : String(error)}`, true);
-    });
+    setAudioPlayBlocked(false);
+    if (audio && audio.src && audio.currentSrc !== SILENT_AUDIO_SRC && audio.paused && !audio.ended) {
+      audioPlayingRef.current = true;
+      void audio.play().catch((error) => {
+        audioPlayingRef.current = false;
+        setAudioPlayBlocked(true);
+        addMessage("system", `Audio playback failed: ${error instanceof Error ? error.message : String(error)}`, true);
+      });
+      return;
+    }
+    playNextAssistantAudio({ ignoreBlocked: true });
   }
 
   async function unlockAssistantAudio() {
-    if (audioUnlockedRef.current) return;
+    if (audioUnlockedRef.current) return true;
     const audio = audioRef.current ?? new Audio();
     audioRef.current = audio;
     const previousSrc = audio.currentSrc || audio.src;
@@ -539,8 +646,10 @@ function App() {
       audio.pause();
       audio.currentTime = 0;
       audioUnlockedRef.current = true;
+      return true;
     } catch {
       audioUnlockedRef.current = false;
+      return false;
     } finally {
       audio.volume = previousVolume;
       audio.muted = previousMuted;
@@ -554,8 +663,7 @@ function App() {
   }
 
   function isAssistantAudioPlaying() {
-    const audio = audioRef.current;
-    return Boolean(pendingAudioUrl && audio && !audio.paused && !audio.ended && audio.currentSrc !== SILENT_AUDIO_SRC);
+    return audioPlayingRef.current;
   }
 
   function stopAssistantAudio() {
@@ -567,17 +675,22 @@ function App() {
       audio.load();
     }
     stopMeter();
+    audioPlayingRef.current = false;
+    audioQueueRef.current = [];
+    preloadedAudioUrlsRef.current.clear();
+    setQueuedAudioCount(0);
+    setResponseActivity({ thinking: false, synthesizing: false, speaking: false });
     setLevel(0);
     setPhase("idle");
     setPendingAudioUrl("");
     setAudioPlayBlocked(false);
   }
 
-  function addMessage(role: TranscriptItem["role"], text: string, error = false, itemProvider?: string, model?: string | null) {
+  function addMessage(role: TranscriptItem["role"], text: string, error = false, itemProvider?: string, model?: string | null, id?: string) {
     setTranscript((items) => [
       ...items,
       {
-        id: makeId(),
+        id: id || makeId(),
         role,
         text,
         error,
@@ -586,6 +699,12 @@ function App() {
         time: new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date())
       }
     ]);
+  }
+
+  function appendMessageText(id: string, text: string) {
+    setTranscript((items) =>
+      items.map((item) => (item.id === id ? { ...item, text: `${item.text}${text}` } : item)),
+    );
   }
 
   async function refreshChats() {
@@ -685,7 +804,7 @@ function App() {
   }
 
   return (
-    <main className={`shell phase-${phase} mobile-panel-${mobilePanel}`}>
+    <main className={`shell phase-${visiblePhase} mobile-panel-${mobilePanel}`}>
       <section className="topbar">
         <div>
           <p className="eyebrow">AI live chat</p>
@@ -766,7 +885,7 @@ function App() {
               <div className="halo halo-two" />
               <div className="halo halo-three" />
               <div className="core">
-                {phase === "listening" ? <Mic size={42} /> : phase === "speaking" ? <Volume2 size={42} /> : currentPhase.icon}
+                {visiblePhase === "listening" ? <Mic size={42} /> : visiblePhase === "speaking" ? <Volume2 size={42} /> : currentPhase.icon}
               </div>
               <div className="waveform" aria-hidden="true">
                 {Array.from({ length: 18 }, (_, index) => (
@@ -775,7 +894,7 @@ function App() {
               </div>
             </div>
             <div className="phase-copy">
-              <strong>{phaseLabel[phase]}</strong>
+              <strong>{phaseLabel[visiblePhase]}</strong>
               <span>{currentPhase.detail}</span>
             </div>
           </section>
@@ -784,8 +903,8 @@ function App() {
             onClick={handlePrimaryAction}
             disabled={!connected}
           >
-            {phase === "idle" || phase === "error" ? <Mic size={20} /> : <Square size={20} />}
-            {primaryActionLabel[phase]}
+            {visiblePhase === "idle" || visiblePhase === "error" ? <Mic size={20} /> : <Square size={20} />}
+            {primaryActionLabel[visiblePhase]}
           </button>
 
           <section className="control-group">
@@ -849,31 +968,31 @@ function App() {
         <section className={`chat-pane ${composerExpanded ? "composer-expanded" : ""}`}>
           <audio ref={audioRef} preload="auto" playsInline className="assistant-audio" />
           <div className="transcript" ref={transcriptRef}>
-            {transcript.length === 0 ? (
+            {transcript.length === 0 && !partialTranscript ? (
               <div className="empty">
                 <h2>Start recording or type a message.</h2>
                 <p>Replies will appear here with provider, model, timestamps, and playback.</p>
               </div>
             ) : (
-              transcript.map((item) => (
-                <article key={item.id} className={`message ${item.role} ${item.error ? "error" : ""}`}>
-                  <header>
-                    <span>{item.role === "assistant" ? "Assistant" : item.role === "user" ? "You" : "System"}</span>
-                    <div className="message-tools">
-                      <button type="button" onClick={() => copyMessageText(item)} title="Copy message text">
-                        <Copy size={14} />
-                        {copiedMessageId === item.id ? "Copied" : "Copy"}
-                      </button>
-                      <time>{item.time}</time>
-                    </div>
-                  </header>
-                  <p>{item.text}</p>
-                  {item.provider ? <footer>{item.provider}{item.model ? ` / ${item.model}` : ""}</footer> : null}
-                </article>
-              ))
+              <>
+                {transcript.map((item) => (
+                  <MessageArticle key={item.id} item={item} copiedMessageId={copiedMessageId} copyMessageText={copyMessageText} />
+                ))}
+                {partialTranscript ? (
+                  <article className="message user partial">
+                    <header>
+                      <span>You</span>
+                      <div className="message-tools">
+                        <time>Live</time>
+                      </div>
+                    </header>
+                    <p>{partialTranscript}</p>
+                  </article>
+                ) : null}
+              </>
             )}
           </div>
-          {audioPlayBlocked && pendingAudioUrl ? (
+          {audioPlayBlocked && (pendingAudioUrl || queuedAudioCount > 0) ? (
             <div className="playback-fallback">
               <span>Audio is ready.</span>
               <button type="button" onClick={resumeAssistantAudio}>
@@ -949,6 +1068,40 @@ function providerDetail(provider?: ProviderStatus) {
   if (provider.disabled) return provider.reason ?? "Disabled.";
   if (provider.configured) return provider.model ? `Model: ${provider.model}` : "Configured.";
   return `Missing ${provider.missing?.join(", ") || "configuration"}.`;
+}
+
+function prioritizedPhase(phase: Phase, activity: ResponseActivity): Phase {
+  if (activity.speaking) return "speaking";
+  if (activity.thinking) return "thinking";
+  if (activity.synthesizing) return "synthesizing";
+  return phase;
+}
+
+function MessageArticle({
+  item,
+  copiedMessageId,
+  copyMessageText,
+}: {
+  item: TranscriptItem;
+  copiedMessageId: string;
+  copyMessageText: (item: TranscriptItem) => void;
+}) {
+  return (
+    <article className={`message ${item.role} ${item.error ? "error" : ""}`}>
+      <header>
+        <span>{item.role === "assistant" ? "Assistant" : item.role === "user" ? "You" : "System"}</span>
+        <div className="message-tools">
+          <button type="button" onClick={() => copyMessageText(item)} title="Copy message text">
+            <Copy size={14} />
+            {copiedMessageId === item.id ? "Copied" : "Copy"}
+          </button>
+          <time>{item.time}</time>
+        </div>
+      </header>
+      <p>{item.text}</p>
+      {item.provider ? <footer>{item.provider}{item.model ? ` / ${item.model}` : ""}</footer> : null}
+    </article>
+  );
 }
 
 function pickMimeType() {

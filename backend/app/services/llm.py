@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,6 +28,9 @@ class Provider(Protocol):
         ...
 
     async def chat(self, messages: list[Message]) -> str:
+        ...
+
+    async def stream_chat(self, messages: list[Message]) -> AsyncIterator[str]:
         ...
 
     async def models(self) -> list[str]:
@@ -59,6 +64,10 @@ class OpenAICompatibleProvider:
     async def chat(self, messages: list[Message]) -> str:
         return await self.chat_with_model(messages, self.model)
 
+    async def stream_chat(self, messages: list[Message]) -> AsyncIterator[str]:
+        async for chunk in self.stream_chat_with_model(messages, self.model):
+            yield chunk
+
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
         missing = self.status()["missing"]
         if "model" in missing and model:
@@ -80,6 +89,42 @@ class OpenAICompatibleProvider:
             response.raise_for_status()
             data = response.json()
         return data["choices"][0]["message"]["content"].strip()
+
+    async def stream_chat_with_model(self, messages: list[Message], model: str | None) -> AsyncIterator[str]:
+        missing = self.status()["missing"]
+        if "model" in missing and model:
+            missing = [item for item in missing if item != "model"]
+        if missing:
+            raise RuntimeError(f"{self.name} is not configured: missing {', '.join(missing)}")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore[union-attr]
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 700,
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = event.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
 
     async def models(self) -> list[str]:
         if not self.base_url:
@@ -126,6 +171,10 @@ class OllamaProvider:
     async def chat(self, messages: list[Message]) -> str:
         return await self.chat_with_model(messages, self.model)
 
+    async def stream_chat(self, messages: list[Message]) -> AsyncIterator[str]:
+        async for chunk in self.stream_chat_with_model(messages, self.model):
+            yield chunk
+
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
         if not model:
             models = await self.available_models()
@@ -141,6 +190,32 @@ class OllamaProvider:
             response.raise_for_status()
             data = response.json()
         return data["message"]["content"].strip()
+
+    async def stream_chat_with_model(self, messages: list[Message], model: str | None) -> AsyncIterator[str]:
+        if not model:
+            models = await self.available_models()
+            for candidate in ("gpt-oss:20b", "gemma4:26b"):
+                if candidate in models:
+                    model = candidate
+                    break
+        if not model:
+            raise RuntimeError("Ollama is not configured: set OLLAMA_MODEL or install gpt-oss:20b/gemma4:26b.")
+        payload = {"model": model, "messages": messages, "stream": True}
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", f"{self.base_url.rstrip('/')}/api/chat", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    content = data.get("message", {}).get("content")
+                    if content:
+                        yield content
+                    if data.get("done"):
+                        break
 
     async def models(self) -> list[str]:
         return await self.available_models()
@@ -162,6 +237,9 @@ class GoogleProvider:
 
     async def chat(self, messages: list[Message]) -> str:
         return await self.chat_with_model(messages, self.model)
+
+    async def stream_chat(self, messages: list[Message]) -> AsyncIterator[str]:
+        yield await self.chat(messages)
 
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
         missing = self.status()["missing"]
@@ -210,6 +288,9 @@ class DisabledProvider:
 
     async def chat(self, messages: list[Message]) -> str:
         raise RuntimeError(f"{self.name} is disabled: {self.reason}")
+
+    async def stream_chat(self, messages: list[Message]) -> AsyncIterator[str]:
+        yield await self.chat(messages)
 
     async def models(self) -> list[str]:
         return []
@@ -310,6 +391,32 @@ class ProviderRegistry:
                 "Choose a different model."
             )
         return response, key, model_override or provider.model
+
+    async def stream_chat(
+        self,
+        provider_key: str | None,
+        model_override: str | None,
+        transcript: list[Message],
+        user_text: str,
+    ) -> tuple[AsyncIterator[str], str, str | None]:
+        key = provider_key or self.settings.default_provider
+        provider = self.providers.get(key)
+        if provider is None:
+            raise RuntimeError(f"Unknown provider: {key}")
+        messages = [
+            {
+                "role": "system",
+                "content": f"{self.get_system_prompt()}\n\n{self.settings.tts_output_prompt}",
+            }
+        ]
+        messages.extend(transcript[-12:])
+        messages.append({"role": "user", "content": user_text})
+        model = model_override or provider.model
+        if hasattr(provider, "stream_chat_with_model"):
+            stream = provider.stream_chat_with_model(messages, model)  # type: ignore[attr-defined]
+        else:
+            stream = provider.stream_chat(messages)
+        return stream, key, model
 
 
 async def cuda_status() -> dict[str, Any]:
