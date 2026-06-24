@@ -13,11 +13,12 @@ Browser mic or typed message -> local faster-whisper STT when needed -> selected
 Set `NVIDIA_API_KEY` in `.env` for the default provider. `NVIDIA_MODEL` defaults to `meta/llama-3.3-70b-instruct`.
 Use `./scripts/install.sh` as the canonical installer; it installs Chatterbox first, then force-upgrades Torch/torchaudio to a CUDA build that supports the RTX 5070 Ti. The installer also installs ffmpeg in the selected Conda environment and writes its absolute path to `FFMPEG_PATH` in `.env`.
 
-To use an existing Conda environment named `rick`, run:
+Use your active Conda environment, or set `ENV_NAME` explicitly:
 
 ```bash
-ENV_NAME=rick ./scripts/install.sh
-ENV_NAME=rick ./scripts/run.sh
+conda activate your-env
+./scripts/install.sh
+./scripts/run.sh
 ```
 
 ## Run
@@ -40,12 +41,11 @@ For Tailscale or LAN access, set `APP_HOST=0.0.0.0` deliberately and protect the
 
 ## Notes
 
-- The Conda environment is `rick-live-chat` and uses Python 3.12.
+- Use a Python 3.12 Conda environment.
 - `/health` reports CUDA, STT, TTS, and provider configuration without loading Whisper or Chatterbox.
 - The UI can save a system prompt for personality/memory. The default is Rick, an AI live chat companion.
 - The UI accepts an MP3 or other audio file as the Chatterbox voice template and normalizes it to WAV.
 - The installer force-installs a recent CUDA PyTorch stack after Chatterbox so RTX 50-series GPUs can be used despite Chatterbox's older Torch pin. TTS uses CUDA automatically when a Torch CUDA smoke test passes.
-- Opencode is listed as disabled until a stable callable CLI/API contract is configured.
 
 ## Security
 

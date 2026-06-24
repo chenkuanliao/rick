@@ -751,9 +751,10 @@ function App() {
     if (!response.ok) return;
     const data = await response.json();
     setChats(data.chats ?? []);
-    const nextId = data.active_chat?.id || data.chats?.[0]?.id || "";
-    if (chatId === activeChatId && nextId) {
-      await loadChat(nextId);
+    if (chatId === activeChatId) {
+      setActiveChatId("");
+      setTranscript([]);
+      setMobilePanel("chats");
     }
   }
 

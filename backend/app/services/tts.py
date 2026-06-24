@@ -53,8 +53,7 @@ class TextToSpeechService:
         except Exception as exc:  # noqa: BLE001
             self._load_error = str(exc)
             raise RuntimeError(
-                "Could not load Chatterbox Turbo TTS. Install Chatterbox/Torch in the "
-                "rick-live-chat Conda environment."
+                "Could not load Chatterbox Turbo TTS. Install Chatterbox/Torch in the active Conda environment."
             ) from exc
 
     def _select_device(self) -> str:

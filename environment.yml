@@ -1,4 +1,3 @@
-name: rick-live-chat
 channels:
   - conda-forge
 dependencies:

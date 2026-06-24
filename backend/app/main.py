@@ -133,9 +133,7 @@ async def update_chat(chat_id: str, payload: ChatUpdatePayload) -> dict[str, Any
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: str) -> dict[str, Any]:
     chats.delete_chat(chat_id)
-    items = chats.list_chats()
-    active_chat = chats.create_chat() if not items else None
-    return {"deleted": True, "chats": chats.list_chats(), "active_chat": active_chat}
+    return {"deleted": True, "chats": chats.list_chats()}
 
 
 @app.post("/api/voice-prompt")

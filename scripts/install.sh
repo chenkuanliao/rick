@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-rick-live-chat}"
+if [[ -z "${ENV_NAME:-}" ]]; then
+  if [[ -n "${CONDA_DEFAULT_ENV:-}" && "$CONDA_DEFAULT_ENV" != "base" ]]; then
+    ENV_NAME="$CONDA_DEFAULT_ENV"
+  else
+    echo "Activate a Conda environment or set ENV_NAME before running this script." >&2
+    exit 1
+  fi
+fi
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
 CONDA_BIN="${CONDA_BIN:-}"
 

@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     tts_output_prompt: str = TTS_OUTPUT_PROMPT
     prompt_store_path: Path = Field(default=DATA_DIR / "memory" / "system_prompt.txt")
+    llm_max_tokens: int = 8192
+    llm_retry_max_tokens: int = 16384
 
     nvidia_api_key: str | None = None
     nvidia_model: str | None = "meta/llama-3.3-70b-instruct"
@@ -71,6 +73,10 @@ class Settings(BaseSettings):
     openai_compatible_base_url: str | None = None
     openai_compatible_api_key: str | None = None
     openai_compatible_model: str | None = None
+
+    opencode_api_key: str | None = None
+    opencode_model: str | None = "deepseek-v4-flash"
+    opencode_base_url: str = "https://opencode.ai/zen/v1"
 
     stt_model: str = "Systran/faster-whisper-medium"
     stt_fallback_model: str = "openai/whisper-base"
@@ -101,6 +107,8 @@ class Settings(BaseSettings):
         "openai_compatible_base_url",
         "openai_compatible_api_key",
         "openai_compatible_model",
+        "opencode_api_key",
+        "opencode_model",
         "stt_language",
         "public_https_url",
         mode="before",

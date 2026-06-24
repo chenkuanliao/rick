@@ -44,6 +44,8 @@ class OpenAICompatibleProvider:
     api_key: str | None
     model: str | None
     required_api_key: bool = True
+    max_tokens: int = 8192
+    retry_max_tokens: int = 16384
 
     def status(self) -> dict[str, Any]:
         missing: list[str] = []
@@ -78,17 +80,32 @@ class OpenAICompatibleProvider:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore[union-attr]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 700,
-        }
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        saw_reasoning = False
+        for token_budget in self._token_budgets():
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": token_budget,
+            }
+            async with httpx.AsyncClient(timeout=180) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+            content = message.get("content", "").strip()
+            if content:
+                return content
+            saw_reasoning = saw_reasoning or bool(message.get("reasoning_content"))
+            if choice.get("finish_reason") != "length":
+                break
+        if saw_reasoning:
+            raise RuntimeError(
+                f"{self.name} returned reasoning but no final answer content. "
+                f"Increase LLM_MAX_TOKENS above {self.retry_max_tokens}."
+            )
+        return ""
 
     async def stream_chat_with_model(self, messages: list[Message], model: str | None) -> AsyncIterator[str]:
         missing = self.status()["missing"]
@@ -100,31 +117,62 @@ class OpenAICompatibleProvider:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore[union-attr]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 700,
-            "stream": True,
-        }
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line.removeprefix("data:").strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    delta = event.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield content
+        saw_reasoning = False
+        finish_reason: str | None = None
+        for token_budget in self._token_budgets():
+            yielded_content = False
+            saw_reasoning_this_attempt = False
+            finish_reason = None
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": token_budget,
+                "stream": True,
+            }
+            async with httpx.AsyncClient(timeout=180) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line.removeprefix("data:").strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = event.get("choices") or []
+                        if not choices:
+                            continue
+                        finish_reason = choices[0].get("finish_reason") or finish_reason
+                        delta = choices[0].get("delta", {})
+                        if delta.get("reasoning_content"):
+                            saw_reasoning = True
+                            saw_reasoning_this_attempt = True
+                        content = delta.get("content")
+                        if content:
+                            yielded_content = True
+                            yield content
+            if yielded_content:
+                break
+            if not saw_reasoning_this_attempt or finish_reason != "length":
+                break
+        else:
+            finish_reason = "length"
+        if not yielded_content and saw_reasoning:
+            reason = f" before finish_reason={finish_reason}" if finish_reason else ""
+            raise RuntimeError(
+                f"{self.name} returned reasoning but no final answer content{reason}. "
+                f"Increase LLM_MAX_TOKENS above {self.retry_max_tokens}."
+            )
+
+    def _token_budgets(self) -> tuple[int, ...]:
+        if self.retry_max_tokens <= self.max_tokens:
+            return (self.max_tokens,)
+        return (self.max_tokens, self.retry_max_tokens)
 
     async def models(self) -> list[str]:
         if not self.base_url:
@@ -305,12 +353,16 @@ class ProviderRegistry:
                 settings.nvidia_base_url,
                 settings.nvidia_api_key,
                 settings.nvidia_model,
+                max_tokens=settings.llm_max_tokens,
+                retry_max_tokens=settings.llm_retry_max_tokens,
             ),
             "openai": OpenAICompatibleProvider(
                 "OpenAI",
                 settings.openai_base_url,
                 settings.openai_api_key,
                 settings.openai_model,
+                max_tokens=settings.llm_max_tokens,
+                retry_max_tokens=settings.llm_retry_max_tokens,
             ),
             "lmstudio": OpenAICompatibleProvider(
                 "LM Studio",
@@ -318,6 +370,8 @@ class ProviderRegistry:
                 "lm-studio",
                 settings.lm_studio_model,
                 required_api_key=False,
+                max_tokens=settings.llm_max_tokens,
+                retry_max_tokens=settings.llm_retry_max_tokens,
             ),
             "openai_compatible": OpenAICompatibleProvider(
                 settings.openai_compatible_name,
@@ -325,13 +379,19 @@ class ProviderRegistry:
                 settings.openai_compatible_api_key,
                 settings.openai_compatible_model,
                 required_api_key=False,
+                max_tokens=settings.llm_max_tokens,
+                retry_max_tokens=settings.llm_retry_max_tokens,
+            ),
+            "opencode": OpenAICompatibleProvider(
+                "OpenCode Zen",
+                settings.opencode_base_url,
+                settings.opencode_api_key,
+                settings.opencode_model,
+                max_tokens=settings.llm_max_tokens,
+                retry_max_tokens=settings.llm_retry_max_tokens,
             ),
             "ollama": OllamaProvider(settings.ollama_base_url, settings.ollama_model),
             "google": GoogleProvider(settings.google_api_key, settings.google_model),
-            "opencode": DisabledProvider(
-                "Opencode",
-                "No stable callable CLI/API contract was configured for this app.",
-            ),
         }
 
     def get_system_prompt(self) -> str:

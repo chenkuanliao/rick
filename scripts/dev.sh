@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-rick-live-chat}"
+if [[ -z "${ENV_NAME:-}" ]]; then
+  if [[ -n "${CONDA_DEFAULT_ENV:-}" && "$CONDA_DEFAULT_ENV" != "base" ]]; then
+    ENV_NAME="$CONDA_DEFAULT_ENV"
+  else
+    echo "Activate a Conda environment or set ENV_NAME before running this script." >&2
+    exit 1
+  fi
+fi
 HOST="${APP_HOST:-127.0.0.1}"
 PORT="${APP_PORT:-8000}"
 CONDA_BIN="${CONDA_BIN:-}"
