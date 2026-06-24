@@ -53,10 +53,16 @@ chats = ChatStore()
 audio_dir = Path(__file__).resolve().parents[2] / "data" / "audio"
 app.mount("/audio", StaticFiles(directory=audio_dir), name="audio")
 
-FIRST_TTS_CHUNK_MIN_CHARS = 90
-NEXT_TTS_CHUNK_TARGET_CHARS = 220
-FIRST_TTS_CHUNK_MAX_SENTENCES = 2
-NEXT_TTS_CHUNK_MAX_SENTENCES = 3
+
+@app.on_event("startup")
+async def preload_speech_models() -> None:
+    if not settings.preload_speech_models:
+        return
+    asyncio.create_task(_preload_speech_models())
+
+
+async def _preload_speech_models() -> None:
+    await asyncio.gather(stt.warmup(), tts.warmup(), return_exceptions=True)
 
 
 class PromptPayload(BaseModel):
@@ -88,10 +94,15 @@ async def config() -> dict[str, Any]:
         "default_provider": settings.default_provider,
         "system_prompt": providers.get_system_prompt(),
         "tts_output_prompt": settings.tts_output_prompt,
-        "providers": await providers.status(),
+        "providers": await providers.status(include_models=False),
         "stt": stt.status,
         "tts": tts.status,
     }
+
+
+@app.get("/api/providers/{provider_key}/models")
+async def provider_models(provider_key: str) -> dict[str, Any]:
+    return {"models": await providers.provider_models(provider_key)}
 
 
 @app.post("/api/system-prompt")
@@ -176,6 +187,8 @@ async def chat_socket(websocket: WebSocket) -> None:
             if active_turn and not active_turn.done():
                 active_turn.cancel()
                 await websocket.send_json({"type": "cancelled"})
+            if partial_transcript and not partial_transcript.done():
+                partial_transcript.cancel()
             active_turn = asyncio.create_task(_handle_turn(websocket, payload))
             active_turn.add_done_callback(_consume_cancelled_turn)
     except WebSocketDisconnect:
@@ -278,10 +291,7 @@ async def _handle_user_text(websocket: WebSocket, payload: dict[str, Any], chat_
     audio_queue: asyncio.Queue[str | None] = asyncio.Queue()
     audio_task = asyncio.create_task(_stream_tts_audio(websocket, audio_queue, provider_key, model))
     response_parts: list[str] = []
-    tts_buffer = ""
-    tts_pending = ""
-    tts_pending_sentences = 0
-    first_tts_chunk_sent = False
+    tts_chunker = StreamingTtsChunker()
     started = False
     try:
         async for delta in stream:
@@ -296,30 +306,11 @@ async def _handle_user_text(websocket: WebSocket, payload: dict[str, Any], chat_
                     }
                 )
             response_parts.append(delta)
-            tts_buffer += delta
             await websocket.send_json({"type": "assistant_delta", "id": assistant_id, "text": delta})
-            sentences, tts_buffer = _pop_complete_tts_sentences(tts_buffer)
-            for sentence in sentences:
-                candidate = f"{tts_pending} {sentence}".strip()
-                if tts_pending and len(candidate) > settings.tts_max_chunk_chars:
-                    await _queue_tts_text(audio_queue, tts_pending)
-                    first_tts_chunk_sent = True
-                    tts_pending = sentence
-                    tts_pending_sentences = 1
-                else:
-                    tts_pending = candidate
-                    tts_pending_sentences += 1
-
-                target_chars = NEXT_TTS_CHUNK_TARGET_CHARS if first_tts_chunk_sent else FIRST_TTS_CHUNK_MIN_CHARS
-                target_sentences = NEXT_TTS_CHUNK_MAX_SENTENCES if first_tts_chunk_sent else FIRST_TTS_CHUNK_MAX_SENTENCES
-                if len(tts_pending) >= target_chars or tts_pending_sentences >= target_sentences:
-                    await _queue_tts_text(audio_queue, tts_pending)
-                    first_tts_chunk_sent = True
-                    tts_pending = ""
-                    tts_pending_sentences = 0
-        remaining = f"{tts_pending} {tts_buffer.strip()}".strip()
-        if remaining:
-            await _queue_tts_text(audio_queue, remaining)
+            for chunk in tts_chunker.push(delta):
+                await _queue_tts_text(audio_queue, chunk)
+        for chunk in tts_chunker.finish():
+            await _queue_tts_text(audio_queue, chunk)
     finally:
         await audio_queue.put(None)
         await audio_task
@@ -337,6 +328,77 @@ async def _handle_user_text(websocket: WebSocket, payload: dict[str, Any], chat_
     await websocket.send_json({"type": "assistant_done", "id": assistant_id})
     await websocket.send_json({"type": "chat", "chat": chat, "chats": chats.list_chats()})
     await websocket.send_json({"type": "status", "phase": "idle"})
+
+
+class StreamingTtsChunker:
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.pending = ""
+        self.pending_sentences = 0
+        self.first_chunk_sent = False
+
+    def push(self, delta: str) -> list[str]:
+        chunks: list[str] = []
+        self.buffer += delta
+
+        sentences, self.buffer = _pop_complete_tts_sentences(self.buffer)
+        for sentence in sentences:
+            chunks.extend(self._append_sentence(sentence))
+
+        if not self.first_chunk_sent:
+            fragment, self.buffer = _pop_speakable_fragment(
+                self.buffer,
+                min_chars=settings.tts_first_chunk_min_chars,
+                max_chars=settings.tts_max_chunk_chars,
+            )
+            if fragment:
+                chunks.extend(self._append_sentence(fragment))
+        return chunks
+
+    def finish(self) -> list[str]:
+        remaining = f"{self.pending} {self.buffer.strip()}".strip()
+        self.pending = ""
+        self.buffer = ""
+        self.pending_sentences = 0
+        if not remaining:
+            return []
+        self.first_chunk_sent = True
+        return [remaining]
+
+    def _append_sentence(self, sentence: str) -> list[str]:
+        sentence = sentence.strip()
+        if not sentence:
+            return []
+
+        chunks: list[str] = []
+        candidate = f"{self.pending} {sentence}".strip()
+        if self.pending and len(candidate) > settings.tts_max_chunk_chars:
+            chunks.append(self.pending)
+            self.first_chunk_sent = True
+            self.pending = sentence
+            self.pending_sentences = 1
+        else:
+            self.pending = candidate
+            self.pending_sentences += 1
+
+        max_sentences = (
+            settings.tts_next_chunk_max_sentences
+            if self.first_chunk_sent
+            else settings.tts_first_chunk_max_sentences
+        )
+        sentence_limit_ready = self.pending_sentences >= max_sentences and len(self.pending) >= self._minimum_flush_chars()
+        if len(self.pending) >= self._target_chars() or sentence_limit_ready:
+            chunks.append(self.pending)
+            self.first_chunk_sent = True
+            self.pending = ""
+            self.pending_sentences = 0
+        return chunks
+
+    def _target_chars(self) -> int:
+        return settings.tts_next_chunk_target_chars if self.first_chunk_sent else settings.tts_first_chunk_min_chars
+
+    def _minimum_flush_chars(self) -> int:
+        return max(120, int(self._target_chars() * 0.75))
 
 
 async def _stream_tts_audio(
@@ -382,6 +444,32 @@ def _pop_complete_tts_sentences(text: str) -> tuple[list[str], str]:
     remaining = text[cut:]
     sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", complete) if item.strip()]
     return sentences, remaining
+
+
+def _pop_speakable_fragment(text: str, *, min_chars: int, max_chars: int) -> tuple[str, str]:
+    cleaned = re.sub(r"\s+", " ", text)
+    if len(cleaned) < min_chars:
+        return "", text
+
+    limit = min(len(cleaned), max_chars)
+    preferred_window_end = min(limit, min_chars + 80)
+    preferred = list(re.finditer(r"[,;:]\s+", cleaned[:preferred_window_end]))
+    if preferred and preferred[-1].end() >= min_chars:
+        cut = preferred[-1].end()
+        return cleaned[:cut].strip(), cleaned[cut:]
+
+    whitespace = [match for match in re.finditer(r"\s+", cleaned[:preferred_window_end]) if match.end() >= min_chars]
+    if whitespace:
+        cut = whitespace[-1].end()
+        return cleaned[:cut].strip(), cleaned[cut:]
+
+    fallback = cleaned.rfind(" ", 0, limit)
+    if fallback >= min_chars:
+        cut = fallback + 1
+        return cleaned[:cut].strip(), cleaned[cut:]
+    if len(cleaned) >= max_chars:
+        return cleaned[:max_chars].strip(), cleaned[max_chars:]
+    return "", text
 
 
 if FRONTEND_DIST.exists():

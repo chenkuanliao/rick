@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     app_title: str = "Rick AI Live Chat"
     public_https_url: str | None = None
     insecure_redirect_hosts: str = ""
+    preload_speech_models: bool = False
 
     default_provider: Literal[
         "nvidia",
@@ -83,6 +84,8 @@ class Settings(BaseSettings):
     stt_device: str = "auto"
     stt_compute_type: str = "auto"
     stt_language: str | None = None
+    stt_beam_size: int = 1
+    stt_vad_filter: bool = True
 
     tts_temperature: float = 0.8
     tts_top_p: float = 0.95
@@ -90,7 +93,11 @@ class Settings(BaseSettings):
     tts_repetition_penalty: float = 1.2
     tts_norm_loudness: bool = True
     tts_device: str = "auto"
-    tts_max_chunk_chars: int = 260
+    tts_max_chunk_chars: int = 900
+    tts_first_chunk_min_chars: int = 180
+    tts_next_chunk_target_chars: int = 650
+    tts_first_chunk_max_sentences: int = 3
+    tts_next_chunk_max_sentences: int = 6
     voice_prompt_path: Path = Field(default=DATA_DIR / "uploads" / "voice_prompt.wav")
 
     ffmpeg_path: str = "ffmpeg"

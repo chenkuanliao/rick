@@ -27,6 +27,9 @@ class SpeechToTextService:
         model = await self._get_model()
         return await asyncio.to_thread(self._transcribe_sync, model, wav_path)
 
+    async def warmup(self) -> None:
+        await self._get_model()
+
     async def _get_model(self) -> Any:
         if self._model is not None:
             return self._model
@@ -57,9 +60,10 @@ class SpeechToTextService:
     def _transcribe_sync(self, model: Any, wav_path: Path) -> str:
         segments, _info = model.transcribe(
             str(wav_path),
-            beam_size=5,
-            vad_filter=True,
+            beam_size=self.settings.stt_beam_size,
+            vad_filter=self.settings.stt_vad_filter,
             language=self.settings.stt_language,
+            condition_on_previous_text=False,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
         return text

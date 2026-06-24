@@ -200,7 +200,14 @@ function App() {
   const audioQueueRef = useRef<string[]>([]);
   const audioPlayingRef = useRef(false);
   const audioUnlockedRef = useRef(false);
-  const preloadedAudioUrlsRef = useRef<Set<string>>(new Set());
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const playbackCursorRef = useRef(0);
+  const playbackActiveCountRef = useRef(0);
+  const pendingAudioDecodesRef = useRef(0);
+  const playbackGenerationRef = useRef(0);
+  const playbackPulseActiveRef = useRef(false);
+  const elementAudioCacheRef = useRef<Map<string, { objectUrl?: string; promise?: Promise<string> }>>(new Map());
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const liveTranscriptSequenceRef = useRef(0);
@@ -223,6 +230,36 @@ function App() {
   useEffect(() => {
     void refreshChats();
   }, []);
+
+  useEffect(() => {
+    if (!config || !provider) return;
+    let cancelled = false;
+    fetch(`/api/providers/${encodeURIComponent(provider)}/models`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`Model list failed: ${res.status}`))))
+      .then((data: { models?: string[] }) => {
+        if (cancelled) return;
+        setConfig((current) => {
+          if (!current?.providers.providers[provider]) return current;
+          return {
+            ...current,
+            providers: {
+              ...current.providers,
+              providers: {
+                ...current.providers.providers,
+                [provider]: {
+                  ...current.providers.providers[provider],
+                  available_models: data.models ?? [],
+                },
+              },
+            },
+          };
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [config?.default_provider, provider]);
 
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -540,13 +577,27 @@ function App() {
     }
   }
 
-  function playAssistantAudio(url: string) {
+  async function getPlaybackContext() {
+    const ExistingAudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (!ExistingAudioContext) return null;
+    const context = playbackContextRef.current ?? new ExistingAudioContext();
+    playbackContextRef.current = context;
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    return context;
+  }
+
+  function playAssistantAudio(url: string, sourceUrl = url) {
     const audio = audioRef.current ?? new Audio();
     audioRef.current = audio;
     audioPlayingRef.current = true;
     audio.preload = "auto";
     audio.setAttribute("playsinline", "true");
-    audio.src = url;
+    audio.muted = false;
+    audio.volume = 1;
+    audio.src = sourceUrl;
+    audio.load();
     setPendingAudioUrl(url);
     setAudioPlayBlocked(false);
     audio.onplay = () => {
@@ -559,6 +610,7 @@ function App() {
       setPendingAudioUrl("");
       audioPlayingRef.current = false;
       setResponseActivity((current) => ({ ...current, speaking: false }));
+      releasePrefetchedElementAudio(url);
       playNextAssistantAudio();
     };
     audio.onerror = () => {
@@ -567,6 +619,7 @@ function App() {
       audioPlayingRef.current = false;
       setResponseActivity((current) => ({ ...current, speaking: false }));
       addMessage("system", "Skipped one speech chunk the browser could not play.", true);
+      releasePrefetchedElementAudio(url);
       playNextAssistantAudio({ ignoreBlocked: true });
     };
     void audio.play().catch((error) => {
@@ -582,41 +635,180 @@ function App() {
   function enqueueAssistantAudio(url: string) {
     const queuedUrl = `${url}?t=${Date.now()}`;
     audioQueueRef.current.push(queuedUrl);
-    preloadAudioUrl(queuedUrl);
     setQueuedAudioCount(audioQueueRef.current.length);
-    playNextAssistantAudio();
+    if (shouldUseElementPlayback()) {
+      void prefetchElementAudio(queuedUrl);
+      playNextAssistantAudio();
+      return;
+    }
+    void decodeAndScheduleAssistantAudio(queuedUrl, playbackGenerationRef.current);
+  }
+
+  async function decodeAndScheduleAssistantAudio(url: string, generation: number) {
+    pendingAudioDecodesRef.current += 1;
+    let usedFallbackPlayback = false;
+    try {
+      const context = await getPlaybackContext();
+      if (!context) {
+        usedFallbackPlayback = true;
+        playAssistantAudio(url);
+        return;
+      }
+      const response = await fetch(url, { cache: "force-cache" });
+      if (!response.ok) throw new Error(`Audio fetch failed: ${response.status}`);
+      const arrayBuffer = await response.arrayBuffer();
+      if (generation !== playbackGenerationRef.current) return;
+      const audioBuffer = await context.decodeAudioData(arrayBuffer.slice(0));
+      if (generation !== playbackGenerationRef.current) return;
+      scheduleAssistantAudioBuffer(context, audioBuffer, url);
+    } catch (error) {
+      if (generation === playbackGenerationRef.current) {
+        usedFallbackPlayback = true;
+        playAssistantAudio(url);
+        addMessage("system", `Used fallback playback for one speech chunk. ${error instanceof Error ? error.message : ""}`.trim(), true);
+      }
+    } finally {
+      pendingAudioDecodesRef.current = Math.max(0, pendingAudioDecodesRef.current - 1);
+      audioQueueRef.current = audioQueueRef.current.filter((item) => item !== url);
+      setQueuedAudioCount(audioQueueRef.current.length);
+      if (!usedFallbackPlayback) {
+        maybeFinishAssistantPlayback();
+      }
+    }
+  }
+
+  function scheduleAssistantAudioBuffer(context: AudioContext, audioBuffer: AudioBuffer, url: string) {
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+
+    const now = context.currentTime;
+    const startAt = Math.max(now + 0.02, playbackCursorRef.current || now + 0.02);
+    playbackCursorRef.current = startAt + audioBuffer.duration;
+    playbackActiveCountRef.current += 1;
+    playbackSourcesRef.current.push(source);
+    audioPlayingRef.current = true;
+    setPendingAudioUrl(url);
+    setAudioPlayBlocked(false);
+    setResponseActivity((current) => ({ ...current, speaking: true }));
+    pulsePlayback();
+
+    source.onended = () => {
+      playbackActiveCountRef.current = Math.max(0, playbackActiveCountRef.current - 1);
+      playbackSourcesRef.current = playbackSourcesRef.current.filter((item) => item !== source);
+      maybeFinishAssistantPlayback();
+    };
+    source.start(startAt);
+  }
+
+  function maybeFinishAssistantPlayback() {
+    if (
+      playbackActiveCountRef.current > 0 ||
+      pendingAudioDecodesRef.current > 0 ||
+      audioQueueRef.current.length > 0
+    ) {
+      return;
+    }
+    if (audioPlayingRef.current) {
+      setLevel(0);
+      setPendingAudioUrl("");
+      audioPlayingRef.current = false;
+      playbackCursorRef.current = 0;
+      setResponseActivity((current) => ({ ...current, speaking: false }));
+      setPhase((current) => (current === "speaking" || current === "synthesizing" ? "idle" : current));
+    }
   }
 
   function playNextAssistantAudio(options: { ignoreBlocked?: boolean } = {}) {
-    if (audioPlayingRef.current || (audioPlayBlocked && !options.ignoreBlocked)) return;
-    const nextAudio = audioQueueRef.current.shift();
-    setQueuedAudioCount(audioQueueRef.current.length);
-    if (!nextAudio) {
-      setPhase((current) => (current === "speaking" || current === "synthesizing" ? "idle" : current));
+    if (audioPlayBlocked && !options.ignoreBlocked) return;
+    if (shouldUseElementPlayback()) {
+      if (audioPlayingRef.current) return;
+      const nextAudio = audioQueueRef.current.shift();
+      setQueuedAudioCount(audioQueueRef.current.length);
+      if (nextAudio) {
+        void playPrefetchedElementAudio(nextAudio, playbackGenerationRef.current);
+      } else {
+        maybeFinishAssistantPlayback();
+      }
       return;
     }
-    const nextQueuedAudio = audioQueueRef.current[0];
-    if (nextQueuedAudio) preloadAudioUrl(nextQueuedAudio);
-    playAssistantAudio(nextAudio);
+    const nextAudio = audioQueueRef.current[0];
+    if (nextAudio) {
+      void decodeAndScheduleAssistantAudio(nextAudio, playbackGenerationRef.current);
+    } else {
+      maybeFinishAssistantPlayback();
+    }
   }
 
-  function preloadAudioUrl(url: string) {
-    if (preloadedAudioUrlsRef.current.has(url)) return;
-    preloadedAudioUrlsRef.current.add(url);
-    void fetch(url, { cache: "force-cache" })
+  function shouldUseElementPlayback() {
+    const ua = navigator.userAgent;
+    const iOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const safari = /^((?!chrome|android).)*safari/i.test(ua);
+    return iOS || safari;
+  }
+
+  async function playPrefetchedElementAudio(url: string, generation: number) {
+    try {
+      const sourceUrl = await prefetchElementAudio(url);
+      if (generation !== playbackGenerationRef.current) return;
+      if (audioPlayingRef.current) return;
+      playAssistantAudio(url, sourceUrl);
+    } catch {
+      if (generation !== playbackGenerationRef.current) return;
+      if (audioPlayingRef.current) return;
+      playAssistantAudio(url);
+    }
+  }
+
+  function prefetchElementAudio(url: string) {
+    const cached = elementAudioCacheRef.current.get(url);
+    if (cached?.objectUrl) return Promise.resolve(cached.objectUrl);
+    if (cached?.promise) return cached.promise;
+
+    const promise = fetch(url, { cache: "force-cache" })
       .then((response) => {
-        if (!response.ok) throw new Error(`Audio preload failed: ${response.status}`);
-        return response.arrayBuffer();
+        if (!response.ok) throw new Error(`Audio prefetch failed: ${response.status}`);
+        return response.blob();
       })
-      .catch(() => {
-        preloadedAudioUrlsRef.current.delete(url);
+      .then((blob) => {
+        const objectUrl = URL.createObjectURL(blob);
+        elementAudioCacheRef.current.set(url, { objectUrl });
+        return objectUrl;
+      })
+      .catch((error) => {
+        elementAudioCacheRef.current.delete(url);
+        throw error;
       });
+
+    elementAudioCacheRef.current.set(url, { promise });
+    return promise;
+  }
+
+  function releasePrefetchedElementAudio(url: string) {
+    const cached = elementAudioCacheRef.current.get(url);
+    if (cached?.objectUrl) URL.revokeObjectURL(cached.objectUrl);
+    elementAudioCacheRef.current.delete(url);
+  }
+
+  function clearPrefetchedElementAudio() {
+    elementAudioCacheRef.current.forEach((cached) => {
+      if (cached.objectUrl) URL.revokeObjectURL(cached.objectUrl);
+    });
+    elementAudioCacheRef.current.clear();
   }
 
   async function resumeAssistantAudio() {
     const audio = audioRef.current;
     await unlockAssistantAudio();
     setAudioPlayBlocked(false);
+    if (!shouldUseElementPlayback()) {
+      try {
+        await playbackContextRef.current?.resume();
+      } catch {
+        setAudioPlayBlocked(true);
+        return;
+      }
+    }
     if (audio && audio.src && audio.currentSrc !== SILENT_AUDIO_SRC && audio.paused && !audio.ended) {
       audioPlayingRef.current = true;
       void audio.play().catch((error) => {
@@ -645,6 +837,9 @@ function App() {
       await audio.play();
       audio.pause();
       audio.currentTime = 0;
+      if (!shouldUseElementPlayback()) {
+        await getPlaybackContext();
+      }
       audioUnlockedRef.current = true;
       return true;
     } catch {
@@ -667,6 +862,19 @@ function App() {
   }
 
   function stopAssistantAudio() {
+    playbackGenerationRef.current += 1;
+    clearPrefetchedElementAudio();
+    playbackSourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch {
+        return;
+      }
+    });
+    playbackSourcesRef.current = [];
+    playbackActiveCountRef.current = 0;
+    pendingAudioDecodesRef.current = 0;
+    playbackCursorRef.current = 0;
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
@@ -676,8 +884,8 @@ function App() {
     }
     stopMeter();
     audioPlayingRef.current = false;
+    playbackPulseActiveRef.current = false;
     audioQueueRef.current = [];
-    preloadedAudioUrlsRef.current.clear();
     setQueuedAudioCount(0);
     setResponseActivity({ thinking: false, synthesizing: false, speaking: false });
     setLevel(0);
@@ -711,8 +919,10 @@ function App() {
     const response = await fetch("/api/chats");
     const data = await response.json();
     setChats(data.chats ?? []);
-    const nextActive = data.active_chat?.id || activeChatId || data.chats?.[0]?.id;
-    if (nextActive) await loadChat(nextActive);
+    if (data.active_chat?.id) {
+      setActiveChatId(data.active_chat.id);
+      setTranscript(toTranscript(data.active_chat.messages ?? []));
+    }
   }
 
   async function loadChat(chatId: string) {
@@ -794,9 +1004,14 @@ function App() {
   }
 
   function pulsePlayback() {
+    if (playbackPulseActiveRef.current) return;
+    playbackPulseActiveRef.current = true;
     let tick = 0;
     const animate = () => {
-      if (audioRef.current?.paused) return;
+      if (!audioPlayingRef.current) {
+        playbackPulseActiveRef.current = false;
+        return;
+      }
       tick += 0.12;
       setLevel(0.35 + Math.abs(Math.sin(tick)) * 0.55);
       animationRef.current = requestAnimationFrame(animate);

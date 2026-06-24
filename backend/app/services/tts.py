@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import tempfile
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -36,6 +35,9 @@ class TextToSpeechService:
         model = await self._get_model()
         async with self._lock:
             return await asyncio.to_thread(self._synthesize_sync, model, text, False)
+
+    async def warmup(self) -> None:
+        await self._get_model()
 
     async def _get_model(self) -> Any:
         if self._model is not None:
@@ -74,47 +76,31 @@ class TextToSpeechService:
 
     def _synthesize_sync(self, model: Any, text: str, split_text: bool = True) -> Path:
         import numpy as np
-        import librosa
         import soundfile as sf
 
-        prompt_path = None
-        prompt_file: Path | None = None
-        try:
-            if self.settings.voice_prompt_path.exists():
-                audio, sample_rate = librosa.load(
-                    self.settings.voice_prompt_path,
-                    sr=None,
-                    mono=True,
-                )
-                prompt_file = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
-                sf.write(prompt_file, audio.astype("float32"), sample_rate)
-                prompt_path = str(prompt_file)
+        prompt_path = str(self.settings.voice_prompt_path) if self.settings.voice_prompt_path.exists() else None
+        chunks = split_tts_text(text, self.settings.tts_max_chunk_chars) if split_text else [text.strip()]
+        pause = np.zeros(int(model.sr * 0.12), dtype="float32")
+        audio_parts = []
+        for index, chunk in enumerate(chunks):
+            wav = model.generate(
+                text=chunk,
+                audio_prompt_path=prompt_path,
+                temperature=self.settings.tts_temperature,
+                top_p=self.settings.tts_top_p,
+                top_k=self.settings.tts_top_k,
+                repetition_penalty=self.settings.tts_repetition_penalty,
+                norm_loudness=self.settings.tts_norm_loudness,
+            )
+            audio = wav.squeeze().detach().cpu().numpy().astype("float32")
+            audio_parts.append(audio)
+            if index < len(chunks) - 1:
+                audio_parts.append(pause)
 
-            chunks = split_tts_text(text, self.settings.tts_max_chunk_chars) if split_text else [text.strip()]
-            pause = np.zeros(int(model.sr * 0.18), dtype="float32")
-            audio_parts = []
-            for index, chunk in enumerate(chunks):
-                wav = model.generate(
-                    text=chunk,
-                    audio_prompt_path=prompt_path,
-                    temperature=self.settings.tts_temperature,
-                    top_p=self.settings.tts_top_p,
-                    top_k=self.settings.tts_top_k,
-                    repetition_penalty=self.settings.tts_repetition_penalty,
-                    norm_loudness=self.settings.tts_norm_loudness,
-                )
-                audio = wav.squeeze().detach().cpu().numpy().astype("float32")
-                audio_parts.append(audio)
-                if index < len(chunks) - 1:
-                    audio_parts.append(pause)
-
-            output_audio = np.concatenate(audio_parts) if audio_parts else np.zeros(1, dtype="float32")
-            output_path = DATA_DIR / "audio" / f"{uuid4().hex}.wav"
-            sf.write(output_path, output_audio, model.sr)
-            return output_path
-        finally:
-            if prompt_file is not None:
-                prompt_file.unlink(missing_ok=True)
+        output_audio = np.concatenate(audio_parts) if audio_parts else np.zeros(1, dtype="float32")
+        output_path = DATA_DIR / "audio" / f"{uuid4().hex}.wav"
+        sf.write(output_path, output_audio, model.sr)
+        return output_path
 
 
 def split_tts_text(text: str, max_chars: int) -> list[str]:

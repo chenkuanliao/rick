@@ -18,6 +18,14 @@ DEGENERATE_TOKEN_PATTERNS = (
     re.compile(r"(>\s*\d+(?:\.\d+)?s\)){2,}"),
     re.compile(r"(.{8,}?)\1{4,}", re.DOTALL),
 )
+REASONING_MODEL_PATTERNS = (
+    re.compile(r"(^|[-_/:])r1($|[-_/:])", re.IGNORECASE),
+    re.compile(r"(^|[-_/:])reason(?:ing)?($|[-_/:])", re.IGNORECASE),
+    re.compile(r"(^|[-_/:])thinking($|[-_/:])", re.IGNORECASE),
+    re.compile(r"(^|[-_/:])think($|[-_/:])", re.IGNORECASE),
+    re.compile(r"^o[134](?:$|[-_/:])", re.IGNORECASE),
+    re.compile(r"^gpt-oss(?:$|[-_/:])", re.IGNORECASE),
+)
 
 
 class Provider(Protocol):
@@ -46,6 +54,7 @@ class OpenAICompatibleProvider:
     required_api_key: bool = True
     max_tokens: int = 8192
     retry_max_tokens: int = 16384
+    disable_thinking: bool = False
 
     def status(self) -> dict[str, Any]:
         missing: list[str] = []
@@ -71,6 +80,7 @@ class OpenAICompatibleProvider:
             yield chunk
 
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
+        validate_non_reasoning_model(self.name, model)
         missing = self.status()["missing"]
         if "model" in missing and model:
             missing = [item for item in missing if item != "model"]
@@ -82,12 +92,7 @@ class OpenAICompatibleProvider:
         url = f"{self.base_url.rstrip('/')}/chat/completions"  # type: ignore[union-attr]
         saw_reasoning = False
         for token_budget in self._token_budgets():
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": token_budget,
-            }
+            payload = self._chat_payload(model, messages, token_budget, stream=False)
             async with httpx.AsyncClient(timeout=180) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
@@ -102,12 +107,13 @@ class OpenAICompatibleProvider:
                 break
         if saw_reasoning:
             raise RuntimeError(
-                f"{self.name} returned reasoning but no final answer content. "
-                f"Increase LLM_MAX_TOKENS above {self.retry_max_tokens}."
+                f"{self.name} returned hidden thinking but no final answer content for {model}. "
+                "Choose a non-reasoning model or a provider that honors disabled thinking mode."
             )
         return ""
 
     async def stream_chat_with_model(self, messages: list[Message], model: str | None) -> AsyncIterator[str]:
+        validate_non_reasoning_model(self.name, model)
         missing = self.status()["missing"]
         if "model" in missing and model:
             missing = [item for item in missing if item != "model"]
@@ -123,13 +129,7 @@ class OpenAICompatibleProvider:
             yielded_content = False
             saw_reasoning_this_attempt = False
             finish_reason = None
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": token_budget,
-                "stream": True,
-            }
+            payload = self._chat_payload(model, messages, token_budget, stream=True)
             async with httpx.AsyncClient(timeout=180) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     response.raise_for_status()
@@ -165,9 +165,29 @@ class OpenAICompatibleProvider:
         if not yielded_content and saw_reasoning:
             reason = f" before finish_reason={finish_reason}" if finish_reason else ""
             raise RuntimeError(
-                f"{self.name} returned reasoning but no final answer content{reason}. "
-                f"Increase LLM_MAX_TOKENS above {self.retry_max_tokens}."
+                f"{self.name} returned hidden thinking but no final answer content for {model}{reason}. "
+                "Choose a non-reasoning model or a provider that honors disabled thinking mode."
             )
+
+    def _chat_payload(
+        self,
+        model: str | None,
+        messages: list[Message],
+        token_budget: int,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": token_budget,
+        }
+        if stream:
+            payload["stream"] = True
+        if self.disable_thinking:
+            payload["thinking"] = {"type": "disabled"}
+        return payload
 
     def _token_budgets(self) -> tuple[int, ...]:
         if self.retry_max_tokens <= self.max_tokens:
@@ -188,7 +208,7 @@ class OpenAICompatibleProvider:
         except Exception:  # noqa: BLE001
             return []
         values = data.get("data", [])
-        return sorted(item.get("id", "") for item in values if item.get("id"))
+        return filter_non_reasoning_models(item.get("id", "") for item in values if item.get("id"))
 
 
 @dataclass
@@ -214,7 +234,7 @@ class OllamaProvider:
                 data = response.json()
         except Exception:  # noqa: BLE001
             return []
-        return [item.get("name", "") for item in data.get("models", []) if item.get("name")]
+        return filter_non_reasoning_models(item.get("name", "") for item in data.get("models", []) if item.get("name"))
 
     async def chat(self, messages: list[Message]) -> str:
         return await self.chat_with_model(messages, self.model)
@@ -224,14 +244,15 @@ class OllamaProvider:
             yield chunk
 
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
+        validate_non_reasoning_model(self.name, model)
         if not model:
             models = await self.available_models()
-            for candidate in ("gpt-oss:20b", "gemma4:26b"):
+            for candidate in ("gemma4:26b",):
                 if candidate in models:
                     model = candidate
                     break
         if not model:
-            raise RuntimeError("Ollama is not configured: set OLLAMA_MODEL or install gpt-oss:20b/gemma4:26b.")
+            raise RuntimeError("Ollama is not configured: set OLLAMA_MODEL to a non-reasoning chat model.")
         payload = {"model": model, "messages": messages, "stream": False}
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(f"{self.base_url.rstrip('/')}/api/chat", json=payload)
@@ -240,14 +261,15 @@ class OllamaProvider:
         return data["message"]["content"].strip()
 
     async def stream_chat_with_model(self, messages: list[Message], model: str | None) -> AsyncIterator[str]:
+        validate_non_reasoning_model(self.name, model)
         if not model:
             models = await self.available_models()
-            for candidate in ("gpt-oss:20b", "gemma4:26b"):
+            for candidate in ("gemma4:26b",):
                 if candidate in models:
                     model = candidate
                     break
         if not model:
-            raise RuntimeError("Ollama is not configured: set OLLAMA_MODEL or install gpt-oss:20b/gemma4:26b.")
+            raise RuntimeError("Ollama is not configured: set OLLAMA_MODEL to a non-reasoning chat model.")
         payload = {"model": model, "messages": messages, "stream": True}
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream("POST", f"{self.base_url.rstrip('/')}/api/chat", json=payload) as response:
@@ -290,6 +312,7 @@ class GoogleProvider:
         yield await self.chat(messages)
 
     async def chat_with_model(self, messages: list[Message], model: str | None) -> str:
+        validate_non_reasoning_model(self.name, model)
         missing = self.status()["missing"]
         if "model" in missing and model:
             missing = [item for item in missing if item != "model"]
@@ -318,7 +341,7 @@ class GoogleProvider:
                 data = response.json()
         except Exception:  # noqa: BLE001
             return []
-        return sorted(
+        return filter_non_reasoning_models(
             item["name"].split("/", 1)[-1]
             for item in data.get("models", [])
             if "generateContent" in item.get("supportedGenerationMethods", [])
@@ -389,6 +412,7 @@ class ProviderRegistry:
                 settings.opencode_model,
                 max_tokens=settings.llm_max_tokens,
                 retry_max_tokens=settings.llm_retry_max_tokens,
+                disable_thinking=True,
             ),
             "ollama": OllamaProvider(settings.ollama_base_url, settings.ollama_model),
             "google": GoogleProvider(settings.google_api_key, settings.google_model),
@@ -409,8 +433,15 @@ class ProviderRegistry:
         self.settings.prompt_store_path.write_text(cleaned, encoding="utf-8")
         return cleaned
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, include_models: bool = True) -> dict[str, Any]:
         result = {key: provider.status() for key, provider in self.providers.items()}
+        if not include_models:
+            for key in result:
+                result[key]["available_models"] = []
+            return {
+                "default": self.settings.default_provider,
+                "providers": result,
+            }
         ollama = self.providers["ollama"]
         if isinstance(ollama, OllamaProvider):
             result["ollama"]["available_models"] = await ollama.available_models()
@@ -421,6 +452,12 @@ class ProviderRegistry:
             "default": self.settings.default_provider,
             "providers": result,
         }
+
+    async def provider_models(self, provider_key: str) -> list[str]:
+        provider = self.providers.get(provider_key)
+        if provider is None:
+            raise RuntimeError(f"Unknown provider: {provider_key}")
+        return await provider.models()
 
     async def chat(
         self,
@@ -513,3 +550,21 @@ def _looks_degenerate(text: str) -> bool:
     if not compact:
         return True
     return any(pattern.search(compact) for pattern in DEGENERATE_TOKEN_PATTERNS)
+
+
+def is_reasoning_model(model: str | None) -> bool:
+    if not model:
+        return False
+    return any(pattern.search(model) for pattern in REASONING_MODEL_PATTERNS)
+
+
+def filter_non_reasoning_models(models: Any) -> list[str]:
+    return sorted(model for model in models if model and not is_reasoning_model(model))
+
+
+def validate_non_reasoning_model(provider_name: str, model: str | None) -> None:
+    if is_reasoning_model(model):
+        raise RuntimeError(
+            f"{provider_name} model {model} is blocked because it is a reasoning/thinking model. "
+            "Choose a non-reasoning chat model."
+        )

@@ -4,6 +4,8 @@ Single-port browser app for live AI chat with an AI named Rick.
 
 Browser mic or typed message -> local faster-whisper STT when needed -> selected LLM provider -> local Chatterbox TTS -> browser playback.
 
+The chat path is chunked for low latency: LLM deltas stream to the browser immediately, the first speakable TTS phrase is queued before the full reply is complete, later TTS chunks synthesize while earlier chunks are playing, and stale live-transcript work is cancelled when the final recording is submitted.
+
 ## Setup
 
 ```bash
@@ -43,6 +45,10 @@ For Tailscale or LAN access, set `APP_HOST=0.0.0.0` deliberately and protect the
 
 - Use a Python 3.12 Conda environment.
 - `/health` reports CUDA, STT, TTS, and provider configuration without loading Whisper or Chatterbox.
+- `PRELOAD_SPEECH_MODELS=true` loads Whisper and Chatterbox in the background at startup so the first real turn does not pay the full model-load cost.
+- Interactive STT defaults to `STT_BEAM_SIZE=1` for lower latency. Increase it if you prefer slower, more exhaustive decoding.
+- TTS chunking is controlled by `TTS_FIRST_CHUNK_MIN_CHARS`, `TTS_NEXT_CHUNK_TARGET_CHARS`, and `TTS_MAX_CHUNK_CHARS`. The defaults favor continuous speech with fewer sentence gaps; smaller chunks reduce time-to-first-audio but can sound choppy.
+- Reasoning/thinking model IDs are filtered from provider model lists and blocked at request time. OpenCode Zen requests include disabled thinking mode so DeepSeek V4 Flash returns final answer content instead of hidden thinking only.
 - The UI can save a system prompt for personality/memory. The default is Rick, an AI live chat companion.
 - The UI accepts an MP3 or other audio file as the Chatterbox voice template and normalizes it to WAV.
 - The installer force-installs a recent CUDA PyTorch stack after Chatterbox so RTX 50-series GPUs can be used despite Chatterbox's older Torch pin. TTS uses CUDA automatically when a Torch CUDA smoke test passes.
