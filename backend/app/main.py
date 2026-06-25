@@ -93,7 +93,6 @@ async def config() -> dict[str, Any]:
     return {
         "default_provider": settings.default_provider,
         "system_prompt": providers.get_system_prompt(),
-        "tts_output_prompt": settings.tts_output_prompt,
         "providers": await providers.status(include_models=False),
         "stt": stt.status,
         "tts": tts.status,
@@ -348,7 +347,7 @@ class StreamingTtsChunker:
         if not self.first_chunk_sent:
             fragment, self.buffer = _pop_speakable_fragment(
                 self.buffer,
-                min_chars=settings.tts_first_chunk_min_chars,
+                min_chars=self._first_chunk_flush_chars(),
                 max_chars=settings.tts_max_chunk_chars,
             )
             if fragment:
@@ -372,7 +371,7 @@ class StreamingTtsChunker:
 
         chunks: list[str] = []
         candidate = f"{self.pending} {sentence}".strip()
-        if self.pending and len(candidate) > settings.tts_max_chunk_chars:
+        if self.pending and len(candidate) > self._max_chunk_chars():
             chunks.append(self.pending)
             self.first_chunk_sent = True
             self.pending = sentence
@@ -387,7 +386,8 @@ class StreamingTtsChunker:
             else settings.tts_first_chunk_max_sentences
         )
         sentence_limit_ready = self.pending_sentences >= max_sentences and len(self.pending) >= self._minimum_flush_chars()
-        if len(self.pending) >= self._target_chars() or sentence_limit_ready:
+        ready_by_length = len(self.pending) >= self._target_chars()
+        if (ready_by_length or sentence_limit_ready) and self._can_flush_pending():
             chunks.append(self.pending)
             self.first_chunk_sent = True
             self.pending = ""
@@ -395,10 +395,24 @@ class StreamingTtsChunker:
         return chunks
 
     def _target_chars(self) -> int:
-        return settings.tts_next_chunk_target_chars if self.first_chunk_sent else settings.tts_first_chunk_min_chars
+        return settings.tts_next_chunk_target_chars if self.first_chunk_sent else self._first_chunk_flush_chars()
 
     def _minimum_flush_chars(self) -> int:
+        if not self.first_chunk_sent:
+            return self._target_chars()
         return max(120, int(self._target_chars() * 0.75))
+
+    def _can_flush_pending(self) -> bool:
+        if self.first_chunk_sent or len(self.pending) >= self._max_chunk_chars():
+            return True
+        remainder = self.buffer.strip()
+        return not remainder or len(remainder) >= settings.tts_first_chunk_min_chars
+
+    def _first_chunk_flush_chars(self) -> int:
+        return min(self._max_chunk_chars(), settings.tts_first_chunk_min_chars * 2)
+
+    def _max_chunk_chars(self) -> int:
+        return _streaming_tts_max_chunk_chars()
 
 
 async def _stream_tts_audio(
@@ -429,10 +443,14 @@ async def _stream_tts_audio(
 
 
 async def _queue_tts_text(audio_queue: asyncio.Queue[str | None], text: str) -> None:
-    for chunk in split_tts_text(text, settings.tts_max_chunk_chars):
+    for chunk in split_tts_text(text, _streaming_tts_max_chunk_chars()):
         cleaned = chunk.strip()
         if cleaned:
             await audio_queue.put(cleaned)
+
+
+def _streaming_tts_max_chunk_chars() -> int:
+    return max(settings.tts_max_chunk_chars, settings.tts_first_chunk_min_chars * 2)
 
 
 def _pop_complete_tts_sentences(text: str) -> tuple[list[str], str]:
@@ -454,22 +472,29 @@ def _pop_speakable_fragment(text: str, *, min_chars: int, max_chars: int) -> tup
     limit = min(len(cleaned), max_chars)
     preferred_window_end = min(limit, min_chars + 80)
     preferred = list(re.finditer(r"[,;:]\s+", cleaned[:preferred_window_end]))
-    if preferred and preferred[-1].end() >= min_chars:
-        cut = preferred[-1].end()
-        return cleaned[:cut].strip(), cleaned[cut:]
+    for match in reversed(preferred):
+        cut = match.end()
+        if cut >= min_chars and _is_tts_fragment_cut_ready(cleaned, cut, max_chars):
+            return cleaned[:cut].strip(), cleaned[cut:]
 
     whitespace = [match for match in re.finditer(r"\s+", cleaned[:preferred_window_end]) if match.end() >= min_chars]
-    if whitespace:
-        cut = whitespace[-1].end()
-        return cleaned[:cut].strip(), cleaned[cut:]
+    for match in reversed(whitespace):
+        cut = match.end()
+        if _is_tts_fragment_cut_ready(cleaned, cut, max_chars):
+            return cleaned[:cut].strip(), cleaned[cut:]
 
     fallback = cleaned.rfind(" ", 0, limit)
-    if fallback >= min_chars:
+    if fallback >= min_chars and _is_tts_fragment_cut_ready(cleaned, fallback + 1, max_chars):
         cut = fallback + 1
         return cleaned[:cut].strip(), cleaned[cut:]
     if len(cleaned) >= max_chars:
         return cleaned[:max_chars].strip(), cleaned[max_chars:]
     return "", text
+
+
+def _is_tts_fragment_cut_ready(text: str, cut: int, max_chars: int) -> bool:
+    remainder = text[cut:].strip()
+    return not remainder or len(remainder) >= settings.tts_first_chunk_min_chars or len(text) >= max_chars
 
 
 if FRONTEND_DIST.exists():

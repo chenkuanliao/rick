@@ -19,7 +19,7 @@ DEFAULT_SYSTEM_PROMPT = (
 TTS_OUTPUT_PROMPT = (
     "Format every assistant reply for text-to-speech. Use natural spoken language, "
     "short paragraphs, no markdown tables, no code fences unless explicitly requested, "
-    "and avoid visual-only formatting. Keep the answer concise unless the user asks "
+    "no emojis, and avoid visual-only formatting. Keep the answer concise unless the user asks "
     "for depth."
 )
 
