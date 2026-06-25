@@ -98,6 +98,15 @@ h1 {
   box-shadow: 0 8px 24px rgba(20, 30, 44, 0.05);
 }
 
+.connection:not(:disabled) {
+  cursor: pointer;
+}
+
+.connection:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
 .connection.online {
   color: var(--green);
   border-color: #b8dfc7;
@@ -106,6 +115,16 @@ h1 {
 .connection.offline {
   color: var(--red);
   border-color: #efb8c2;
+}
+
+.spin {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .mobile-tabs {

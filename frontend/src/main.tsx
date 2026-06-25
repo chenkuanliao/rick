@@ -23,6 +23,7 @@ import {
   Volume2,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import "./styles.css";
 
@@ -43,7 +44,6 @@ type ProviderStatus = {
 type ConfigResponse = {
   default_provider: string;
   system_prompt: string;
-  tts_output_prompt: string;
   providers: {
     default: string;
     providers: Record<string, ProviderStatus>;
@@ -178,6 +178,7 @@ function App() {
   const [pendingAudioUrl, setPendingAudioUrl] = useState("");
   const [queuedAudioCount, setQueuedAudioCount] = useState(0);
   const [audioPlayBlocked, setAudioPlayBlocked] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chat");
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [partialTranscript, setPartialTranscript] = useState("");
@@ -212,6 +213,9 @@ function App() {
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const liveTranscriptSequenceRef = useRef(0);
   const liveTranscriptLastSentRef = useRef(0);
+  const suppressChatLoadUntilRef = useRef(0);
+  const chatTitlePointerDownRef = useRef<{ chatId: string; time: number } | null>(null);
+  const renameLoadBlockedRef = useRef(false);
 
   useEffect(() => {
     setMicStatus(getBrowserMicStatus());
@@ -230,6 +234,12 @@ function App() {
   useEffect(() => {
     void refreshChats();
   }, []);
+
+  useEffect(() => {
+    if (renamingChatId && mobilePanel !== "chats") {
+      setMobilePanel("chats");
+    }
+  }, [renamingChatId, mobilePanel]);
 
   useEffect(() => {
     if (!config || !provider) return;
@@ -262,17 +272,12 @@ function App() {
   }, [config?.default_provider, provider]);
 
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${protocol}://${window.location.host}/ws/chat`);
-    socketRef.current = ws;
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => {
-      setPhase("error");
-      addMessage("system", "WebSocket connection failed.", true);
+    connectSocket();
+    return () => {
+      const socket = socketRef.current;
+      socketRef.current = null;
+      socket?.close();
     };
-    ws.onmessage = (event) => handleSocketMessage(JSON.parse(event.data));
-    return () => ws.close();
   }, []);
 
   useEffect(() => {
@@ -926,6 +931,7 @@ function App() {
   }
 
   async function loadChat(chatId: string) {
+    if (renameLoadBlockedRef.current || Date.now() < suppressChatLoadUntilRef.current || renamingChatId) return;
     const response = await fetch(`/api/chats/${chatId}`);
     if (!response.ok) return;
     const data = await response.json();
@@ -969,14 +975,74 @@ function App() {
   }
 
   function startRename(chat: ChatSummary) {
+    suppressChatLoadAfterRenameInteraction();
+    renameLoadBlockedRef.current = true;
+    setMobilePanel("chats");
     setRenamingChatId(chat.id);
     setRenameValue(chat.title);
   }
 
-  async function finishRename(chatId: string) {
-    await updateChat(chatId, { title: renameValue });
+  function cancelRename() {
+    suppressChatLoadAfterRenameInteraction();
     setRenamingChatId("");
     setRenameValue("");
+    window.setTimeout(() => {
+      renameLoadBlockedRef.current = false;
+    }, 500);
+  }
+
+  async function finishRename(chatId: string) {
+    suppressChatLoadAfterRenameInteraction();
+    await updateChat(chatId, { title: renameValue });
+    cancelRename();
+  }
+
+  function suppressChatLoadAfterRenameInteraction() {
+    suppressChatLoadUntilRef.current = Date.now() + 5000;
+    chatTitlePointerDownRef.current = null;
+  }
+
+  function markChatTitlePointerDown(chatId: string) {
+    chatTitlePointerDownRef.current = { chatId, time: Date.now() };
+  }
+
+  function loadChatFromTitleClick(chatId: string) {
+    const pointer = chatTitlePointerDownRef.current;
+    chatTitlePointerDownRef.current = null;
+    if (!pointer || pointer.chatId !== chatId || Date.now() - pointer.time > 1200) return;
+    void loadChat(chatId);
+  }
+
+  function connectSocket(manual = false) {
+    const current = socketRef.current;
+    if (!manual && current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) return;
+    if (manual && current?.readyState === WebSocket.CONNECTING) return;
+
+    current?.close();
+    setReconnecting(true);
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${protocol}://${window.location.host}/ws/chat`);
+    socketRef.current = ws;
+
+    ws.onopen = () => {
+      if (socketRef.current !== ws) return;
+      setConnected(true);
+      setReconnecting(false);
+      setPhase((currentPhase) => (currentPhase === "error" ? "idle" : currentPhase));
+    };
+    ws.onclose = () => {
+      if (socketRef.current !== ws) return;
+      setConnected(false);
+      setReconnecting(false);
+    };
+    ws.onerror = () => {
+      if (socketRef.current !== ws) return;
+      setConnected(false);
+      setReconnecting(false);
+      setPhase("error");
+      addMessage("system", manual ? "Reconnect failed." : "WebSocket connection failed.", true);
+    };
+    ws.onmessage = (event) => handleSocketMessage(JSON.parse(event.data));
   }
 
   function startMeter(stream: MediaStream) {
@@ -1026,10 +1092,16 @@ function App() {
           <p className="eyebrow">AI live chat</p>
           <h1>Rick</h1>
         </div>
-        <div className={connected ? "connection online" : "connection offline"}>
-          {connected ? <Wifi size={18} /> : <WifiOff size={18} />}
-          {connected ? "Connected" : "Offline"}
-        </div>
+        <button
+          type="button"
+          className={connected ? "connection online" : "connection offline"}
+          onClick={() => connectSocket(true)}
+          disabled={connected || reconnecting}
+          title={connected ? "Connected" : "Reconnect"}
+        >
+          {connected ? <Wifi size={18} /> : reconnecting ? <LoaderCircle size={18} className="spin" /> : <WifiOff size={18} />}
+          {connected ? "Connected" : reconnecting ? "Reconnecting" : "Offline"}
+        </button>
       </section>
 
       <nav className="mobile-tabs" aria-label="Mobile sections">
@@ -1056,35 +1128,107 @@ function App() {
           <div className="chat-scroll">
             {chats.map((chat) => (
               <div key={chat.id} className={`chat-row ${chat.id === activeChatId ? "selected" : ""}`}>
-                <button className="chat-title" onClick={() => loadChat(chat.id)}>
-                  {renamingChatId === chat.id ? (
+                {renamingChatId === chat.id ? (
+                  <div
+                    className="chat-title rename-title"
+                    onClick={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onPointerUp={(event) => event.stopPropagation()}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onMouseUp={(event) => event.stopPropagation()}
+                    onTouchStart={(event) => event.stopPropagation()}
+                    onTouchEnd={(event) => event.stopPropagation()}
+                  >
                     <input
                       value={renameValue}
                       autoFocus
-                      onChange={(event) => setRenameValue(event.target.value)}
-                      onBlur={() => finishRename(chat.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void finishRename(chat.id);
-                        if (event.key === "Escape") setRenamingChatId("");
+                      enterKeyHint="done"
+                      onFocus={(event) => event.stopPropagation()}
+                      onBlur={(event) => {
+                        event.stopPropagation();
+                        suppressChatLoadAfterRenameInteraction();
                       }}
+                      onBeforeInput={(event) => {
+                        event.stopPropagation();
+                        suppressChatLoadAfterRenameInteraction();
+                      }}
+                      onInput={(event) => {
+                        event.stopPropagation();
+                        suppressChatLoadAfterRenameInteraction();
+                      }}
+                      onChange={(event) => {
+                        suppressChatLoadAfterRenameInteraction();
+                        setRenameValue(event.target.value);
+                      }}
+                      onClick={(event) => event.stopPropagation()}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onPointerUp={(event) => event.stopPropagation()}
+                      onTouchStart={(event) => event.stopPropagation()}
+                      onTouchEnd={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => {
+                        event.stopPropagation();
+                        suppressChatLoadAfterRenameInteraction();
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void finishRename(chat.id);
+                        }
+                        if (event.key === "Escape") cancelRename();
+                      }}
+                      onKeyUp={(event) => event.stopPropagation()}
                     />
-                  ) : (
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="chat-title"
+                    onPointerDown={() => markChatTitlePointerDown(chat.id)}
+                    onMouseDown={() => markChatTitlePointerDown(chat.id)}
+                    onTouchStart={() => markChatTitlePointerDown(chat.id)}
+                    onClick={() => loadChatFromTitleClick(chat.id)}
+                  >
                     <>
                       <span>{chat.title}</span>
                       <small>{chat.message_count} messages</small>
                     </>
-                  )}
-                </button>
+                  </button>
+                )}
                 <div className="chat-actions">
-                  <button title={chat.pinned ? "Unpin chat" : "Pin chat"} onClick={() => updateChat(chat.id, { pinned: !chat.pinned })}>
-                    {chat.pinned ? <PinOff size={15} /> : <Pin size={15} />}
-                  </button>
-                  <button title="Rename chat" onClick={() => startRename(chat)}>
-                    <Pencil size={15} />
-                  </button>
-                  <button title="Delete chat" onClick={() => deleteChat(chat.id)}>
-                    <Trash2 size={15} />
-                  </button>
+                  {renamingChatId === chat.id ? (
+                    <>
+                      <button
+                        type="button"
+                        title="Save chat name"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void finishRename(chat.id);
+                        }}
+                      >
+                        <CheckCircle2 size={15} />
+                      </button>
+                      <button
+                        type="button"
+                        title="Cancel rename"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          cancelRename();
+                        }}
+                      >
+                        <X size={15} />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button type="button" title={chat.pinned ? "Unpin chat" : "Pin chat"} onClick={() => updateChat(chat.id, { pinned: !chat.pinned })}>
+                        {chat.pinned ? <PinOff size={15} /> : <Pin size={15} />}
+                      </button>
+                      <button type="button" title="Rename chat" onClick={() => startRename(chat)}>
+                        <Pencil size={15} />
+                      </button>
+                      <button type="button" title="Delete chat" onClick={() => deleteChat(chat.id)}>
+                        <Trash2 size={15} />
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
